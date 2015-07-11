@@ -9,6 +9,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE RecursiveDo #-}
 module Reflex.QML.Internal.AppHost where
 
 import Control.Applicative
@@ -28,6 +29,7 @@ import Reflex.Host.Class
 import qualified Data.DList as DL
 import qualified Data.Foldable as F
 import qualified Data.Traversable as T
+import qualified Data.Map as Map
 
 --------------------------------------------------------------------------------
 
@@ -150,6 +152,7 @@ class (ReflexHost t, MonadSample t m, MonadHold t m, MonadReflexCreateTrigger t 
   performPostBuild_ :: HostFrame t (AppInfo t) -> m ()
   dynAppHost :: Dynamic t (m a) -> m (Event t a)
   collectPostActions :: m a -> m (m (), a)
+  collection :: Event t [m (a, Event t ())] -> m (Event t [a])
 
 instance (ReflexHost t, MonadIO (HostFrame t)) => MonadAppHost t (AppHost t) where
   getAsyncFire = AppHost $ fmap liftIO . writeChan . envEventChan <$> ask
@@ -164,6 +167,17 @@ instance (ReflexHost t, MonadIO (HostFrame t)) => MonadAppHost t (AppHost t) whe
       initialInfo <- execAppHostFrame env =<< sample (current appDyn)
       switchAppInfo initialInfo updatedInfo
     return revent
+    
+  collection newItems = do
+      env <- AppHost ask
+      newViews <- performEvent $ mapM (runAppHostFrame env) <$> newItems
+      updatedViews <- collect (fmap rearrange <$> newViews)
+      let (info, results) = splitE $ unzip <$> updatedViews
+          
+      performPostBuild_ $ switchAppInfo mempty (fmap mconcat info)
+      pure results
+        where
+          rearrange (a, (b, c)) = ((a, b), c)
 
   collectPostActions (AppHost app) = do
     env <- AppHost ask
@@ -223,3 +237,35 @@ holdAppHost mInit mChanged = do
   (applyPostActions, aInit) <- collectPostActions mInit
   aChanged <- dynAppHost =<< holdDyn (aInit <$ applyPostActions) mChanged
   holdDyn aInit aChanged
+  
+getPostBuild :: (MonadAppHost t m) =>  m (Event t ())
+getPostBuild  = do
+  (event, fire) <- newEventWithFire return  
+  performPostBuild_ $  pure $ mempty { triggersToFire = Ap $ fire () }
+  return event  
+  
+performEventAsync :: MonadAppHost t m => Event t (IO a) -> m (Event t a)
+performEventAsync event = do
+  (result, fire) <- newExternalEvent
+  performEvent_ $ void . liftIO . forkIO .  (void . fire =<<) <$> event
+  return result     
+  
+
+--------------------------------------------------------------------------------
+
+-- | Utilities to support 'collection'  
+addCount :: (MonadHold t m, Reflex t, MonadFix m) =>  Event t [a] -> m (Event t [(Int, a)])
+addCount e = do
+  c <- foldDyn ((+) . length) 0 e
+  pure $ attachWith (zip . enumFrom) (current c) e
+  
+collect ::  (MonadHold t m, Reflex t, MonadFix m) => Event t [(a, Event t ())] -> m (Event t [a]) 
+collect newItems = do
+  rec
+    itemsId <- addCount newItems
+    itemDyn <- foldDyn ($) mempty $ mergeWith (.)
+      [ mappend . Map.fromList  <$> itemsId
+       , flip Map.difference <$> removeItems
+      ]
+    let removeItems = switch (mergeMap . fmap snd <$> current itemDyn)   
+  pure $ fmap fst . Map.elems <$> updated itemDyn  
